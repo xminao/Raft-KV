@@ -324,9 +324,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	// 0: args.term > currentTerm, switch role to follower and update current term to args.term
 	// 1: candidate, args.term = current term, switch to follower
-	// 2: follower, update election time out
+	// 2: follower, just update election time out
 	// 3: leader, do nothing
 	rf.mu.Lock()
+
 	if rf.currentTerm < args.Term {
 		rf.switchRole(ROLE_FOLLOWER)
 		rf.currentTerm = args.Term
@@ -334,15 +335,16 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.heartbeatFlag = 1
 	}
 
-	// reset election time out
-	if rf.currentRole == ROLE_FOLLOWER {
-		rf.heartbeatFlag = 1
-	} else if (rf.currentRole == ROLE_CONDIDATE && rf.currentTerm == args.Term) {
+	if rf.currentTerm == args.Term && rf.currentRole == ROLE_CONDIDATE {
 		rf.switchRole(ROLE_FOLLOWER)
-		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.heartbeatFlag = 1
 	}
+
+	if rf.currentRole == ROLE_FOLLOWER {
+		rf.heartbeatFlag = 1
+	}
+
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 }
