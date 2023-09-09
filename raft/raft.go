@@ -176,12 +176,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-//
+// RPC:
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidatedID int
 }
 
 //
@@ -190,6 +192,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -197,6 +201,32 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+
+	fmt.Printf("[RequestVote] ID=%D, Role=%d, Term=%d recived vote request.", rf.me, rf.currentRole, rf.currentTerm)
+
+	rf.heartbeatFlag = 1
+	// if request's term is new, switch to Follower and reset vote and term
+	if rf.currentTerm < args.Term {
+		rf.switchRole(ROLE_FOLLOWER)
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	switch rf.currentRole {
+	case ROLE_FOLLOWER:
+		if rf.votedFor == -1 {
+			rf.votedFor = args.CandidatedID
+			reply.VoteGranted = true
+		} else {
+			reply.VoteGranted = false
+		}
+	case ROLE_CONDIDATE, ROLE_LEADER:
+		reply.VoteGranted = false
+	}
+
+	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
 }
 
 //
@@ -319,6 +349,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 //
+// RPC: AppendEntries args and reply
+//
+type RequestAppendEntriesArgs struct {
+	Term int
+}
+
+type RequestAppendEntriesReply struct {
+	Term int
+}
+
+//
 // Request AppendEntries
 //
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
@@ -347,17 +388,6 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
-}
-
-//
-// AppendEntries args and reply
-//
-type RequestAppendEntriesArgs struct {
-	Term int
-}
-
-type RequestAppendEntriesReply struct {
-	Term int
 }
 
 //
