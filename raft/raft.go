@@ -18,10 +18,8 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
 
-	//	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -160,27 +158,35 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 //
-// Leader, send heartbeat (and appendentries)
+// Leader
+// send heartbeat (no log AppendEntries)
 //
 func (rf *Raft) SendHeartbeat() {
 	for server := range rf.peers {
+		// send heartbeat rpc to every peer.
 		if server == rf.me {
 			continue
 		}
 		go func(server int) {
-			args := RequestAppendEntriesArgs{} // empty, just heartbeat
+			// empty appendEntries, heartbeat
+			args := RequestAppendEntriesArgs{}
 			reply := RequestAppendEntriesReply{}
 			rf.mu.Lock()
 			args.Term = rf.currentTerm
 			rf.mu.Unlock()
+
 			ok := rf.sendAppendEntries(server, &args, &reply)
 			if !ok {
-				fmt.Printf("[SendHeartbeat]  ID=%d, Role=%d, Term=%d send heartbeat to Server=%d failed.\n", rf.me, rf.currentRole, rf.currentTerm, server)
+				//fmt.Printf("[SendHeartbeat]  ID=%d, Role=%d, Term=%d send heartbeat to Server=%d failed.\n", rf.me, rf.currentRole, rf.currentTerm, server)
 				return
+			} else {
+				//fmt.Printf("[SendHeartbeat]  ID=%d, Role=%d, Term=%d send heartbeat to Server=%d successed.\n", rf.me, rf.currentRole, rf.currentTerm, server)
 			}
 
+			// handle reply from peer which response.
 			rf.mu.Lock()
 			if reply.Term > args.Term {
+				// switch to follower if new leader exist.
 				rf.switchRole(ROLE_FOLLOWER)
 				rf.votedFor = -1
 				rf.currentTerm = reply.Term
@@ -191,7 +197,8 @@ func (rf *Raft) SendHeartbeat() {
 }
 
 //
-// Candidate, Request vote for other server to elect.
+// Candidate
+// Request vote for other server to elect.
 //
 func (rf *Raft) StartElection() {
 	// reset vote count and time out
@@ -200,16 +207,16 @@ func (rf *Raft) StartElection() {
 	rf.currentTerm += 1
 	rf.electionTimer.Reset(getRandomTimeout()) // reset election timeout
 
-	fmt.Printf("[Election] ID=%d start election.", rf.me)
+	//fmt.Printf("[Election] ID=%d start election.", rf.me)
 	// start collection votes
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
+
 		// start new goroutine to send request vote rpc
 		go func(server int) {
 			rf.mu.Lock()
-			fmt.Printf("[StartElection] ID=%d, Role=%d, Term=%d send vote request to Server=%d.\n", rf.me, rf.currentRole, rf.currentTerm, server)
 			args := RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidatedID: rf.me,
@@ -217,12 +224,13 @@ func (rf *Raft) StartElection() {
 			reply := RequestVoteReply{}
 			rf.mu.Unlock()
 
+			//fmt.Printf("[StartElection] ID=%d, Role=%d, Term=%d send vote request to Server=%d.\n", rf.me, rf.currentRole, rf.currentTerm, server)
 			ok := rf.sendRequestVote(server, &args, &reply)
 			if !ok {
-				fmt.Printf("[StartElection] ID=%d, Role=%d, Term=%d request vote to Server=%d failed.\n", rf.me, rf.currentRole, rf.currentRole, server)
+				//fmt.Printf("[StartElection] ID=%d, Role=%d, Term=%d request vote to Server=%d failed.\n", rf.me, rf.currentRole, rf.currentRole, server)
 				return
 			} else {
-				fmt.Printf("[StartElection] ID=%d, Role=%d, Term=%d request vote to Server=%d successed. vote count=%d\n", rf.me, rf.currentRole, rf.currentRole, server, rf.votedCount)
+				//fmt.Printf("[StartElection] ID=%d, Role=%d, Term=%d request vote to Server=%d successed. vote count=%d\n", rf.me, rf.currentRole, rf.currentRole, server, rf.votedCount)
 			}
 
 			rf.mu.Lock()
@@ -231,31 +239,13 @@ func (rf *Raft) StartElection() {
 				rf.switchRole(ROLE_FOLLOWER)
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
-				rf.mu.Unlock()
-				return
-			}
-
-			// if request vote success
-			if reply.VoteGranted {
-				rf.votedCount = rf.votedCount + 1
-			}
-			votedCount := rf.votedCount
-			currentRole := rf.currentRole
-			rf.mu.Unlock()
-
-			// majority vote
-			if votedCount*2 > len(rf.peers) {
-				rf.mu.Lock()
-				if rf.currentRole == ROLE_CANDIDATE {
-					// prevent current raft server became follower(received rpc) when handle rpc.
+			} else if reply.VoteGranted && rf.currentRole == ROLE_CANDIDATE {
+				rf.votedCount += 1
+				if rf.votedCount*2 > len(rf.peers) {
 					rf.switchRole(ROLE_LEADER)
-					currentRole = rf.currentRole
-				}
-				rf.mu.Unlock()
-				if currentRole == ROLE_LEADER {
-					rf.SendHeartbeat()
 				}
 			}
+			rf.mu.Unlock()
 		}(server)
 	}
 }
@@ -268,7 +258,7 @@ func (rf *Raft) CheckHeartbeat() {
 	if rf.heartbeatFlag != 1 {
 		// time out, start new election
 		// follower --> candidate
-		fmt.Printf("[CheckHeartbeat] ID=%d, Role=%d, Term=%d heartbeat time out, start new election.\n", rf.me, rf.currentRole, rf.currentTerm)
+		//fmt.Printf("[CheckHeartbeat] ID=%d, Role=%d, Term=%d heartbeat time out, start new election.\n", rf.me, rf.currentRole, rf.currentTerm)
 		rf.switchRole(ROLE_CANDIDATE)
 	}
 	// reset heartbeat
@@ -302,7 +292,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	fmt.Printf("[RequestVote] ID=%d, Role=%d, Term=%d recived vote request.\n", rf.me, rf.currentRole, rf.currentTerm)
+	//fmt.Printf("[RequestVote] ID=%d, Role=%d, Term=%d recived vote request.\n", rf.me, rf.currentRole, rf.currentTerm)
 
 	rf.heartbeatFlag = 1
 	// if request's term is new, switch to Follower and reset vote and term
@@ -420,7 +410,7 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTimer.C:
 			// heartbeat timeout
 			// leader send heartbeat to followers.
-			fmt.Printf("[Ticker] ID=%d Heartbeat time out.\n", rf.me)
+			//fmt.Printf("[Ticker] ID=%d Heartbeat time out.\n", rf.me)
 			rf.mu.Lock()
 			if rf.currentRole == ROLE_LEADER {
 				rf.SendHeartbeat()
@@ -431,7 +421,7 @@ func (rf *Raft) ticker() {
 			// election timeout
 			// candidate: start election; follower: become candidate and start election.
 			rf.mu.Lock()
-			fmt.Printf("[Ticker] ID=%d Election time out.\n", rf.me)
+			//fmt.Printf("[Ticker] ID=%d Election time out.\n", rf.me)
 			switch rf.currentRole {
 			case ROLE_CANDIDATE:
 				rf.StartElection()
@@ -469,11 +459,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.applyCh = applyCh
 	rf.heartbeatTimer = time.NewTimer(HEARTBEAT_TIMEOUT * time.Millisecond)
 	elecT := getRandomTimeout()
-	fmt.Printf("[Make] ID=%d Election Timer=%dms\n", rf.me, elecT.Milliseconds())
+	//fmt.Printf("[Make] ID=%d Election Timer=%dms\n", rf.me, elecT.Milliseconds())
 	rf.electionTimer = time.NewTimer(elecT)
 	rf.mu.Unlock()
 
-	fmt.Printf("[Raft] Peer=%d start...\n", me)
+	//fmt.Printf("[Raft] Peer=%d start...\n", me)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -528,15 +518,25 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 
 //
 // Switch role
+// revoker need lock
 //
 func (rf *Raft) switchRole(role ServerRole) {
 	if role == rf.currentRole {
 		return
 	}
-	fmt.Printf("[SwitchRole] ID=%d, Role=%d Term=%d ===> Role=%d.\n", rf.me, rf.currentRole, rf.currentTerm, role)
+	//fmt.Printf("[SwitchRole] ID=%d, Role=%d Term=%d ===> Role=%d.\n", rf.me, rf.currentRole, rf.currentTerm, role)
 	rf.currentRole = role
-	if rf.currentRole == ROLE_FOLLOWER {
+	switch role {
+	case ROLE_FOLLOWER:
+		rf.heartbeatTimer.Stop()
+		rf.electionTimer.Reset(getRandomTimeout())
 		rf.votedFor = -1
+	case ROLE_CANDIDATE:
+		rf.StartElection()
+	case ROLE_LEADER:
+		rf.electionTimer.Stop()
+		rf.SendHeartbeat()
+		rf.heartbeatTimer.Reset(HEARTBEAT_TIMEOUT * time.Millisecond)
 	}
 }
 
