@@ -59,7 +59,7 @@ const (
 	ROLE_FOLLOWER     ServerRole = 1
 	ROLE_CANDIDATE    ServerRole = 2
 	ROLE_LEADER       ServerRole = 3
-	HEARTBEAT_TIMEOUT            = 100
+	HEARTBEAT_TIMEOUT            = 100 // 100ms, 10times per second.
 )
 
 //
@@ -75,14 +75,15 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm    int
-	votedFor       int
-	currentRole    ServerRole
-	heartbeatFlag  int
-	votedCount     int
-	applyCh        chan ApplyMsg
 	heartbeatTimer *time.Timer
 	electionTimer  *time.Timer
+	currentRole    ServerRole
+	votedCount     int
+
+	currentTerm int
+	votedFor    int
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -167,6 +168,7 @@ func (rf *Raft) SendHeartbeat() {
 		if server == rf.me {
 			continue
 		}
+		// new goroutine, prevent blocked.
 		go func(server int) {
 			// empty appendEntries, heartbeat
 			args := RequestAppendEntriesArgs{}
@@ -188,7 +190,6 @@ func (rf *Raft) SendHeartbeat() {
 			if reply.Term > args.Term {
 				// switch to follower if new leader exist.
 				rf.switchRole(ROLE_FOLLOWER)
-				rf.votedFor = -1
 				rf.currentTerm = reply.Term
 			}
 			rf.mu.Unlock()
@@ -250,22 +251,6 @@ func (rf *Raft) StartElection() {
 	}
 }
 
-//
-// Follower, Check Heartbeat
-//
-func (rf *Raft) CheckHeartbeat() {
-	rf.mu.Lock()
-	if rf.heartbeatFlag != 1 {
-		// time out, start new election
-		// follower --> candidate
-		//fmt.Printf("[CheckHeartbeat] ID=%d, Role=%d, Term=%d heartbeat time out, start new election.\n", rf.me, rf.currentRole, rf.currentTerm)
-		rf.switchRole(ROLE_CANDIDATE)
-	}
-	// reset heartbeat
-	rf.heartbeatFlag = 0
-	rf.mu.Unlock()
-}
-
 // RPC:
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -294,7 +279,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	//fmt.Printf("[RequestVote] ID=%d, Role=%d, Term=%d recived vote request.\n", rf.me, rf.currentRole, rf.currentTerm)
 
-	rf.heartbeatFlag = 1
 	// if request's term is new, switch to Follower and reset vote and term
 	if rf.currentTerm < args.Term {
 		rf.switchRole(ROLE_FOLLOWER)
@@ -427,7 +411,6 @@ func (rf *Raft) ticker() {
 				rf.StartElection()
 			case ROLE_FOLLOWER:
 				rf.switchRole(ROLE_CANDIDATE)
-				rf.StartElection()
 			}
 			rf.mu.Unlock()
 		}
@@ -483,6 +466,7 @@ type RequestAppendEntriesArgs struct {
 
 type RequestAppendEntriesReply struct {
 	Term int
+	Flag bool
 }
 
 //
@@ -494,31 +478,26 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	// 2: follower, just update election time out
 	// 3: leader, do nothing
 	rf.mu.Lock()
-
-	if rf.currentTerm < args.Term {
+	defer rf.mu.Unlock()
+	reply.Flag = true
+	if rf.currentTerm > args.Term {
+		reply.Flag = false
+		reply.Term = rf.currentTerm
+		return
+	} else if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term // update term with new term and switch to follower.
 		rf.switchRole(ROLE_FOLLOWER)
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.heartbeatFlag = 1
-	}
-
-	if rf.currentTerm == args.Term && rf.currentRole == ROLE_CANDIDATE {
+	} else if rf.currentTerm == args.Term && rf.currentRole == ROLE_CANDIDATE { // a leader won, switch to follower
 		rf.switchRole(ROLE_FOLLOWER)
-		rf.votedFor = -1
-		rf.heartbeatFlag = 1
 	}
-
-	if rf.currentRole == ROLE_FOLLOWER {
-		rf.heartbeatFlag = 1
-	}
-
+	// !!! reset electiontimer when recived rpc.
+	rf.electionTimer.Reset(getRandomTimeout())
 	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
 }
 
 //
 // Switch role
-// revoker need lock
+// revoker must hold lock
 //
 func (rf *Raft) switchRole(role ServerRole) {
 	if role == rf.currentRole {
@@ -528,13 +507,11 @@ func (rf *Raft) switchRole(role ServerRole) {
 	rf.currentRole = role
 	switch role {
 	case ROLE_FOLLOWER:
-		rf.heartbeatTimer.Stop()
-		rf.electionTimer.Reset(getRandomTimeout())
+		rf.electionTimer.Reset(getRandomTimeout()) // reset election timeout
 		rf.votedFor = -1
 	case ROLE_CANDIDATE:
 		rf.StartElection()
 	case ROLE_LEADER:
-		rf.electionTimer.Stop()
 		rf.SendHeartbeat()
 		rf.heartbeatTimer.Reset(HEARTBEAT_TIMEOUT * time.Millisecond)
 	}
@@ -544,7 +521,7 @@ func (rf *Raft) switchRole(role ServerRole) {
 // Get random time.
 //
 func getRandomTimeout() time.Duration {
-	return time.Duration(300+rand.Intn(150)) * time.Millisecond
+	return time.Duration(HEARTBEAT_TIMEOUT*3+rand.Intn(HEARTBEAT_TIMEOUT)) * time.Millisecond
 }
 
 //
