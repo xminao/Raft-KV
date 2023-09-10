@@ -1,3 +1,5 @@
+![raft-kv-logo](https://github.com/xminao/raft-kv/raw/master/imgs/raft-kv.png)
+
 # Raft-KV
 
 ### RequestAppendEntries
