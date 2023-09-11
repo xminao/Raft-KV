@@ -45,10 +45,6 @@ type ApplyMsg struct {
 	CommandIndex int
 
 	// For 2D:
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
 }
 
 //
@@ -692,60 +688,65 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3: leader, do nothing
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	fmt.Printf("[AppendEntries] ID=%d, Term=%d send AppendEntries to ID=%d, Term=%d",
+		args.LeaderId, args.Term, rf.me, rf.currentTerm)
 	reply.Success = true
-	if rf.currentTerm > args.Term {
-		reply.Success = false
+
+	// 1. Reply false if args term < current term
+	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		reply.Success = false
 		return
-	} else if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term // update term with new term and switch to follower.
-		rf.switchRole(ROLE_FOLLOWER)
-	} else if rf.currentTerm == args.Term && rf.currentRole == ROLE_CANDIDATE { // a leader won, switch to follower
+	}
+
+	// 2. switch to follower if args term > current term, and reset election time out
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
 		rf.switchRole(ROLE_FOLLOWER)
 	}
-	// !!! reset electiontimer when recived rpc.
+	// reset election when received rpc except args term < current term
+	// (rpc send from leader)
 	rf.electionTimer.Reset(getRandomTimeout())
-	reply.Term = rf.currentTerm
 
-	// Log replication
-	// 1. check, args.PrevLogTerm =? local log[args.PrevLogIndex]
-	// 	a. PrevLog not exist, success=false
-	//  b. PrevLog exist, but conflict, success=false
-	//  c. Prevlog exist, not conflict, continue to replication
-	lastLogIndex := len(rf.log)
-	// a. follower's log length < leader's log length
+	// 2. Log consistency check
+	// current peer's last log's index or term need to = leader's one
+
+	// a. current peers' last log's index < leader's one
+	lastLogIndex := len(rf.log) - 1
 	if lastLogIndex < args.PrevLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		// thinks follower's log matches with leader's as a subset.
-		reply.ConflictIndex = len(rf.log) + 1
-		// no conflict term
-		reply.ConflictTerm = -1
 		return
 	}
 
-	// b. if an existing entry conflicts with a new one (same index but different term)
-	//    delete the existing entries and all that follow it.
-	if rf.log[(args.PrevLogIndex)].Term != args.PrevLogTerm {
+	// b. current peer's last log's index >= leader's one, but term in args prevLogIndex not
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		// follower's log in certain term unmatches leader'log
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
-
-		// leader ceck the former term
-		// set ConflictIndex to the first one of entries in Conflict term
-		conflictIndex := args.PrevLogIndex
-		// since rf.log[0] are ensured to match among all servers
-		// ConflictIndex must be > 0, safe to minus 1
-		for rf.log[conflictIndex-1].Term == reply.ConflictTerm {
-			conflictIndex -= 1
-		}
-		reply.ConflictIndex = conflictIndex
 		return
 	}
 
-	// c. append any new entries not already in the log
-	//   compare from rf.log[args.PrevLogIndex + 1]
+	// 3. Append any new entries not already in the index from args.PrevLogIndex + 1
+	// a.
+	unmatchIndex := -1
+	for index := range args.Entries {
+		if rf.log[args.PrevLogIndex+index+1].Term != args.Entries[index].Term {
+			unmatchIndex = index
+			break
+		}
+	}
+
+	if unmatchIndex != -1 {
+		// there are unmatche entries
+		// truncate unmatch follower entries, and cover leader entries
+		rf.log = rf.log[:(args.PrevLogIndex + unmatchIndex + 1)]
+		rf.log = append(rf.log, args.Entries[unmatchIndex:]...)
+	}
+
+	// 4. if leader's commit > commitIndex, set commitIndex = min(leader's commit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+
+	}
 }
 
 //
@@ -765,6 +766,14 @@ func (rf *Raft) switchRole(role ServerRole) {
 	case ROLE_CANDIDATE:
 		rf.StartElection()
 	case ROLE_LEADER:
+		// initialize nextIndex with leader last log index + 1
+		// initialize matchIndex with 0
+		for i := range rf.nextIndex {
+			rf.nextIndex[i] = len(rf.log) // index start with 0
+		}
+		for i := range rf.matchIndex {
+			rf.matchIndex[i] = 0
+		}
 		rf.SendHeartbeat()
 		rf.heartbeatTimer.Reset(HEARTBEAT_TIMEOUT * time.Millisecond)
 	}
@@ -788,5 +797,29 @@ func getCurrentTime() int64 {
 // set commit index
 //
 func (rf *Raft) setCommitIndex(index int) {
+	rf.commitIndex = index
+	// apply entries between lastApplied and commmit
+	// should be revoked after current commitIndex updated.
+	if rf.commitIndex > rf.lastApplied {
+		fmt.Printf("[Apply] ID=%d apply between index=%d and index=%d", rf.me, rf.lastApplied+1, rf.commitIndex)
+		entriesToApply := append([]LogEntry{}, rf.log[(rf.lastApplied+1):(rf.commitIndex+1)]...)
 
+		go func(startIndex int, entries []LogEntry) {
+			for index, entry := range entries {
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: startIndex + index,
+				}
+				rf.applyCh <- msg
+				// update lastApplied
+				// another goroutine, protect it with lock
+				rf.mu.Lock()
+				if rf.lastApplied < msg.CommandIndex {
+					rf.lastApplied = msg.CommandIndex
+				}
+				rf.mu.Unlock()
+			}
+		}(rf.lastApplied+1, entriesToApply)
+	}
 }
