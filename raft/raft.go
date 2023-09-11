@@ -91,12 +91,14 @@ type Raft struct {
 	votedCount     int
 	votedFor       int
 
+	log     []LogEntry
+	applyCh chan ApplyMsg
+
+	// Volatile state on all servers
 	commitIndex int // index of highest log entry known to be commited.
 	lastApplied int // index of highest log entry applied to state machine.
-	log         []LogEntry
-	applyCh     chan ApplyMsg
 
-	// leader
+	// Volatile state on Leaders (reinitialized after election)
 	nextIndex  []int // for each server, index of the next log entry to send to that server.
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server.
 }
@@ -378,9 +380,11 @@ func (rf *Raft) StartElection() {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidatedID int
+	Term         int // Candidate's term
+	CandidatedID int // Candidate's ID who requesting vote
+	// for candidate restriction
+	LastLogIndex int // index of candidate's last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 //
@@ -388,40 +392,106 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
+	Term        int  // term of peer who be request to vote, for candidate update itself
+	VoteGranted bool // true: vote to candidate who request; false: disagree who request
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	//fmt.Printf("[RequestVote] ID=%d, Role=%d, Term=%d recived vote request.\n", rf.me, rf.currentRole, rf.currentTerm)
 
-	// if request's term is new, switch to Follower and reset vote and term
-	if rf.currentTerm < args.Term {
-		rf.switchRole(ROLE_FOLLOWER)
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-	}
-
-	switch rf.currentRole {
-	case ROLE_FOLLOWER:
-		if rf.votedFor == -1 {
-			rf.votedFor = args.CandidatedID
-			reply.VoteGranted = true
-		} else {
-			reply.VoteGranted = false
-		}
-	case ROLE_CANDIDATE, ROLE_LEADER:
+	// term --> identity --> log
+	if rf.currentTerm > args.Term {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		return
 	}
 
+	if rf.currentTerm == args.Term {
+		switch rf.currentRole {
+		case ROLE_FOLLOWER:
+			// prevent the same peer request vote again.
+			if rf.votedFor != -1 && rf.votedFor != args.CandidatedID {
+				reply.Term = rf.currentTerm
+				reply.VoteGranted = false
+				return
+			}
+		case ROLE_CANDIDATE, ROLE_LEADER:
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+			return
+		}
+	}
+
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.switchRole(ROLE_FOLLOWER)
+	}
+
+	// candidate' vote should be at least up-to-date as receiver's log
+	// up-to-date:
+	// a. the logs have last entries with different terms, the log with the later term is more up-to-date
+	// b. the logs end with the same term, then whichever log is longer is more up-to-date
+	lastLogIndex := len(rf.log) - 1
+	// a.
+	if args.LastLogTerm < rf.log[lastLogIndex].Term {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	// b.
+	if (args.LastLogTerm == rf.log[lastLogIndex].Term && args.LastLogIndex < lastLogIndex) {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	rf.votedFor = args.CandidatedID
 	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
+	reply.VoteGranted = true
+	// reset timer after grant vote
+	rf.electionTimer.Reset(getRandomTimeout())
+
+	//// a. Args' Term is new
+	//// switch to
+	//if rf.currentTerm < args.Term {
+	//	rf.switchRole(ROLE_FOLLOWER)
+	//	rf.currentTerm = args.Term
+	//	rf.votedFor = -1
+	//}
+	//
+	//if rf.currentTerm > args.Term {
+	//	reply.Term = rf.currentTerm
+	//	reply.VoteGranted = false
+	//	return
+	//}
+	//
+	//// b. Args' Term is equals to current term
+	//// if request's term is new, switch to Follower and reset vote and term
+	//if rf.currentTerm < args.Term {
+	//	rf.switchRole(ROLE_FOLLOWER)
+	//	rf.currentTerm = args.Term
+	//	rf.votedFor = -1
+	//}
+	//
+	//switch rf.currentRole {
+	//case ROLE_FOLLOWER:
+	//	if rf.votedFor == -1 {
+	//		rf.votedFor = args.CandidatedID
+	//		reply.VoteGranted = true
+	//	} else {
+	//		reply.VoteGranted = false
+	//	}
+	//case ROLE_CANDIDATE, ROLE_LEADER:
+	//	reply.VoteGranted = false
+	//}
+	//
+	//reply.Term = rf.currentTerm
+	//rf.mu.Unlock()
 }
 
 //
@@ -459,7 +529,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -483,7 +553,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	if rf.currentRole != ROLE_LEADER {
+		isLeader = false
+	}
 	return index, term, isLeader
 }
 
@@ -610,9 +682,10 @@ type AppendEntriesReply struct {
 }
 
 //
-// Request AppendEntries
+// handle AppendEntries
+// rf: peer who reviced appendEntries
 //
-func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// 0: args.term > currentTerm, switch role to follower and update current term to args.term
 	// 1: candidate, args.term = current term, switch to follower
 	// 2: follower, just update election time out
@@ -633,6 +706,46 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 	// !!! reset electiontimer when recived rpc.
 	rf.electionTimer.Reset(getRandomTimeout())
 	reply.Term = rf.currentTerm
+
+	// Log replication
+	// 1. check, args.PrevLogTerm =? local log[args.PrevLogIndex]
+	// 	a. PrevLog not exist, success=false
+	//  b. PrevLog exist, but conflict, success=false
+	//  c. Prevlog exist, not conflict, continue to replication
+	lastLogIndex := len(rf.log)
+	// a. follower's log length < leader's log length
+	if lastLogIndex < args.PrevLogIndex {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		// thinks follower's log matches with leader's as a subset.
+		reply.ConflictIndex = len(rf.log) + 1
+		// no conflict term
+		reply.ConflictTerm = -1
+		return
+	}
+
+	// b. if an existing entry conflicts with a new one (same index but different term)
+	//    delete the existing entries and all that follow it.
+	if rf.log[(args.PrevLogIndex)].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		// follower's log in certain term unmatches leader'log
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+
+		// leader ceck the former term
+		// set ConflictIndex to the first one of entries in Conflict term
+		conflictIndex := args.PrevLogIndex
+		// since rf.log[0] are ensured to match among all servers
+		// ConflictIndex must be > 0, safe to minus 1
+		for rf.log[conflictIndex-1].Term == reply.ConflictTerm {
+			conflictIndex -= 1
+		}
+		reply.ConflictIndex = conflictIndex
+		return
+	}
+
+	// c. append any new entries not already in the log
+	//   compare from rf.log[args.PrevLogIndex + 1]
 }
 
 //
