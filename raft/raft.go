@@ -20,6 +20,7 @@ package raft
 import (
 	"math/rand"
 
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +64,14 @@ const (
 )
 
 //
+// Log Entry
+//
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
+//
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -78,12 +87,18 @@ type Raft struct {
 	heartbeatTimer *time.Timer
 	electionTimer  *time.Timer
 	currentRole    ServerRole
+	currentTerm    int
 	votedCount     int
+	votedFor       int
 
-	currentTerm int
-	votedFor    int
+	commitIndex int // index of highest log entry known to be commited.
+	lastApplied int // index of highest log entry applied to state machine.
+	log         []LogEntry
+	applyCh     chan ApplyMsg
 
-	applyCh chan ApplyMsg
+	// leader
+	nextIndex  []int // for each server, index of the next log entry to send to that server.
+	matchIndex []int // for each server, index of highest log entry known to be replicated on server.
 }
 
 // return currentTerm and whether this server
@@ -160,6 +175,113 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 //
 // Leader
+// revoke by leader, for send append entries
+//
+func (rf *Raft) SendAppendEntries() {
+	// send append entries to all peers.
+	for server := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+		go func(server int) {
+			// append entries args by leader
+			args := AppendEntriesArgs{}
+			reply := AppendEntriesReply{}
+
+			// check if need replicate log
+			rf.mu.Lock()
+			if rf.currentRole != ROLE_LEADER {
+				rf.mu.Unlock()
+				return
+			}
+			// initialize appendEntries which need send
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+			// PrevLogIndex: index of log entry immediately preceding new ones.
+			args.PrevLogIndex = rf.nextIndex[server] - 1
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+			args.LeaderCommit = rf.commitIndex
+			// exist log not commit in leader peer, need replicate to followers.
+			// rf.log: log entries in leader peer.
+			// rf.matchIndex[server]: the highest commit log index in leader peer.
+			// log need to replicate: [matchIndex[server] + 1, len[rf.log]]
+			if len(rf.log) != rf.matchIndex[server] {
+				for i := rf.nextIndex[server]; i <= len(rf.log); i += 1 {
+					args.Entries = append(args.Entries, rf.log[i])
+				}
+			}
+			rf.mu.Unlock()
+
+			// send appendEntries
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			if !ok {
+				fmt.Printf("[SendAppendEntries] ID=%d send AppendEntries to ID=%d failed.", rf.me, server)
+			} else {
+				fmt.Printf("[SendAppendEntries] ID=%d send AppendEntries to ID=%d success.", rf.me, server)
+			}
+
+			// handle reply
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if reply.Term > args.Term {
+				rf.switchRole(ROLE_FOLLOWER)
+				rf.currentTerm = reply.Term
+				return
+			}
+
+			if rf.currentRole != ROLE_LEADER || rf.currentTerm != args.Term {
+				return
+			}
+
+			if reply.Success {
+				// replication success, increase nextIndex and matchIndex
+				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+				fmt.Printf("[SendAppendEntries] Leader ID=%d replicate log to ID=%d success, nextIndex=%v, matchIndex=%v.",
+					rf.me, server, rf.nextIndex, rf.matchIndex)
+
+				// check if can commit
+				for N := len(rf.log); N > rf.commitIndex; N -= 1 {
+					if rf.log[N].Term != rf.currentTerm {
+						continue
+					}
+
+					// count for peer who replicate success. (initialize with 1, include leader self)
+					matchCount := 1
+					for j := 0; j < len(rf.matchIndex); j += 1 {
+						if rf.matchIndex[j] >= N {
+							matchCount += 1
+						}
+					}
+
+					// count * 2 > rf.peers, commit.
+					if matchCount*2 > len(rf.peers) {
+						rf.setCommitIndex(N)
+						break
+					}
+				}
+			} else {
+				// send append entries failed.
+				// set server nextIndex - 1, try again in next rpc.
+				rf.nextIndex[server] = reply.ConflictIndex
+
+				if reply.ConflictTerm != -1 {
+					for i := args.PrevLogIndex; i >= 1; i -= 1 {
+						if rf.log[i].Term == reply.ConflictTerm {
+							rf.nextIndex[server] = i
+							break
+						}
+					}
+				}
+
+			}
+		}(server)
+	}
+}
+
+//
+// Leader
 // send heartbeat (no log AppendEntries)
 //
 func (rf *Raft) SendHeartbeat() {
@@ -171,8 +293,8 @@ func (rf *Raft) SendHeartbeat() {
 		// new goroutine, prevent blocked.
 		go func(server int) {
 			// empty appendEntries, heartbeat
-			args := RequestAppendEntriesArgs{}
-			reply := RequestAppendEntriesReply{}
+			args := AppendEntriesArgs{}
+			reply := AppendEntriesReply{}
 			rf.mu.Lock()
 			args.Term = rf.currentTerm
 			rf.mu.Unlock()
@@ -336,7 +458,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
 	return ok
 }
@@ -436,17 +558,28 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.me = me
 
 	rf.mu.Lock()
-	rf.currentTerm = 1             // initialize with 1
-	rf.votedFor = -1               // peer id, -1: not vote for any peer
-	rf.currentRole = ROLE_FOLLOWER // initialize with follower
-	rf.applyCh = applyCh
 	rf.heartbeatTimer = time.NewTimer(HEARTBEAT_TIMEOUT * time.Millisecond)
 	elecT := getRandomTimeout()
-	//fmt.Printf("[Make] ID=%d Election Timer=%dms\n", rf.me, elecT.Milliseconds())
 	rf.electionTimer = time.NewTimer(elecT)
-	rf.mu.Unlock()
+	//fmt.Printf("[Make] ID=%d Election Timer=%dms\n", rf.me, elecT.Milliseconds())
+	rf.currentRole = ROLE_FOLLOWER
+	rf.currentTerm = 1 // initialize with 1.
+	rf.votedFor = -1   // peer id, -1: not vote for any peer.
 
-	//fmt.Printf("[Raft] Peer=%d start...\n", me)
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	rf.log = make([]LogEntry, 0)
+	rf.applyCh = applyCh
+	for peer := range rf.peers {
+		rf.nextIndex[peer] = 0
+		rf.matchIndex[peer] = -1
+	}
+
+	rf.mu.Unlock()
+	fmt.Printf("[Raft] Peer=%d start...\n", me)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -460,28 +593,35 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 //
 // RPC: AppendEntries args and reply
 //
-type RequestAppendEntriesArgs struct {
-	Term int
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int // AppendEntries consistency check
+	PrevLogTerm  int // AppendEntries consistency check
+	Entries      []LogEntry
+	LeaderCommit int // leader's commitIndex
 }
 
-type RequestAppendEntriesReply struct {
-	Term int
-	Flag bool
+type AppendEntriesReply struct {
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 //
 // Request AppendEntries
 //
-func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// 0: args.term > currentTerm, switch role to follower and update current term to args.term
 	// 1: candidate, args.term = current term, switch to follower
 	// 2: follower, just update election time out
 	// 3: leader, do nothing
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Flag = true
+	reply.Success = true
 	if rf.currentTerm > args.Term {
-		reply.Flag = false
+		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	} else if rf.currentTerm < args.Term {
@@ -529,4 +669,11 @@ func getRandomTimeout() time.Duration {
 //
 func getCurrentTime() int64 {
 	return time.Now().UnixNano()
+}
+
+//
+// set commit index
+//
+func (rf *Raft) setCommitIndex(index int) {
+
 }
