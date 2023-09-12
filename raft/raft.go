@@ -19,8 +19,6 @@ package raft
 
 import (
 	"math/rand"
-
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +43,10 @@ type ApplyMsg struct {
 	CommandIndex int
 
 	// For 2D:
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
 }
 
 //
@@ -175,106 +177,88 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // Leader
 // revoke by leader, for send append entries
 //
-func (rf *Raft) SendppendEntries() {
-	// send append entries to all peers.
-	for server := range rf.peers {
-		if server == rf.me {
-			continue
+func (rf *Raft) SendAppendEntries() {
+	for peer := range rf.peers {
+		if peer != rf.me {
+			go rf.SendAppendEntry(peer)
 		}
-		go func(server int) {
-			// append entries args by leader
-			args := AppendEntriesArgs{}
-			reply := AppendEntriesReply{}
+	}
+}
 
-			// check if need replicate log
-			rf.mu.Lock()
-			if rf.currentRole != ROLE_LEADER {
-				rf.mu.Unlock()
-				return
-			}
-			// initialize appendEntries which need send
-			args.Term = rf.currentTerm
-			args.LeaderId = rf.me
-			// PrevLogIndex: index of log entry immediately preceding new ones.
-			args.PrevLogIndex = rf.nextIndex[server] - 1
-			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-			args.LeaderCommit = rf.commitIndex
-			// exist log not commit in leader peer, need replicate to followers.
-			// rf.log: log entries in leader peer.
-			// rf.matchIndex[server]: the highest commit log index in leader peer.
-			// log need to replicate: [matchIndex[server] + 1, len[rf.log]]
-			if len(rf.log) != rf.matchIndex[server] {
-				for i := rf.nextIndex[server]; i <= len(rf.log); i += 1 {
-					args.Entries = append(args.Entries, rf.log[i])
-				}
-			}
+func (rf *Raft) SendAppendEntry(server int) {
+	rf.mu.Lock()
+	if rf.currentRole != ROLE_LEADER {
+		rf.mu.Unlock()
+		return
+	}
+
+	prevLogIndex := rf.nextIndex[server] - 1
+
+	// user deep copy to avoid race condition when override log in AppendEntries()
+	entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+	copy(entries, rf.log[prevLogIndex+1:])
+
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	if args.PrevLogIndex > -1 {
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+	}
+	reply := AppendEntriesReply{}
+	rf.mu.Unlock()
+
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	if !ok {
+		//fmt.Printf("[SendAppendEntries] ID=%d send append entires to ID=%d failed.", rf.me, server)
+	} else {
+		rf.mu.Lock()
+		if rf.currentRole != ROLE_LEADER {
 			rf.mu.Unlock()
+			return
+		}
+		// if leader's last log index >= nextIndex for a follower, send AppendEntries RPC
+		// with log entries start at nextIndex. (it means follower slow than leader)
+		// - if success=true, update nextIndex and matchIndex for follower.
+		// - if success=false because of log inconsistency, decrement nextIndex for this follower and retry.
+		if reply.Success {
+			// success
+			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
 
-			// send appendEntries
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			if !ok {
-				fmt.Printf("[SendAppendEntries] ID=%d send AppendEntries to ID=%d failed.", rf.me, server)
-			} else {
-				fmt.Printf("[SendAppendEntries] ID=%d send AppendEntries to ID=%d success.", rf.me, server)
+			// if there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N,
+			// and log[N].term == currentTerm: set commitIndex = N
+			// - leader's last log entry index: len(rf.log) - 1
+			// - leader's last commit index: rf.commitIndex
+			for N := len(rf.log) - 1; N > rf.commitIndex; N -= 1 {
+				// count for log entry in index of N is replicated(matched) more than 1/2 peers.
+				count := 0
+				for _, matchIndex := range rf.matchIndex {
+					if matchIndex >= N {
+						count += 1
+					}
+				}
+				// if more than 1/2 peers matched log entry in index N, commit N.
+				// leader's commit in sendAppendEntries and wait for more than 1/2 peers reply.
+				// follower's commit in received appendEntries.
+				if count*2 > len(rf.peers) {
+					rf.setCommitIndex(N)
+					break
+				}
 			}
-
-			// handle reply
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
-			if reply.Term > args.Term {
-				rf.switchRole(ROLE_FOLLOWER)
+		} else {
+			// failed because of log inconsistency.
+			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
-				return
-			}
-
-			if rf.currentRole != ROLE_LEADER || rf.currentTerm != args.Term {
-				return
-			}
-
-			if reply.Success {
-				// replication success, increase nextIndex and matchIndex
-				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
-				fmt.Printf("[SendAppendEntries] Leader ID=%d replicate log to ID=%d success, nextIndex=%v, matchIndex=%v.",
-					rf.me, server, rf.nextIndex, rf.matchIndex)
-
-				// check if can commit
-				for N := len(rf.log); N > rf.commitIndex; N -= 1 {
-					if rf.log[N].Term != rf.currentTerm {
-						continue
-					}
-
-					// count for peer who replicate success. (initialize with 1, include leader self)
-					matchCount := 1
-					for j := 0; j < len(rf.matchIndex); j += 1 {
-						if rf.matchIndex[j] >= N {
-							matchCount += 1
-						}
-					}
-
-					// count * 2 > rf.peers, commit.
-					if matchCount*2 > len(rf.peers) {
-						rf.setCommitIndex(N)
-						break
-					}
-				}
+				rf.switchRole(ROLE_FOLLOWER)
 			} else {
-				// send append entries failed.
-				// set server nextIndex - 1, try again in next rpc.
-				rf.nextIndex[server] = reply.ConflictIndex
-
-				if reply.ConflictTerm != -1 {
-					for i := args.PrevLogIndex; i >= 1; i -= 1 {
-						if rf.log[i].Term == reply.ConflictTerm {
-							rf.nextIndex[server] = i
-							break
-						}
-					}
-				}
-
+				rf.nextIndex[server] = args.PrevLogIndex - 1
 			}
-		}(server)
+		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -282,6 +266,7 @@ func (rf *Raft) SendppendEntries() {
 // Leader
 // send heartbeat (no log AppendEntries)
 //
+/*
 func (rf *Raft) SendHeartbeat() {
 	for server := range rf.peers {
 		// send heartbeat rpc to every peer.
@@ -316,6 +301,7 @@ func (rf *Raft) SendHeartbeat() {
 		}(server)
 	}
 }
+*/
 
 //
 // Candidate
@@ -432,15 +418,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// up-to-date:
 	// a. the logs have last entries with different terms, the log with the later term is more up-to-date
 	// b. the logs end with the same term, then whichever log is longer is more up-to-date
+
 	lastLogIndex := len(rf.log) - 1
 	// a.
-	if args.LastLogTerm < rf.log[lastLogIndex].Term {
+	if lastLogIndex != -1 && args.LastLogTerm < rf.log[lastLogIndex].Term {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 	// b.
-	if args.LastLogTerm == rf.log[lastLogIndex].Term && args.LastLogIndex < lastLogIndex {
+	if lastLogIndex != -1 && args.LastLogTerm == rf.log[lastLogIndex].Term && args.LastLogIndex < lastLogIndex {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -549,8 +536,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	if rf.currentRole != ROLE_LEADER {
-		isLeader = false
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+	isLeader = rf.currentRole == ROLE_LEADER
+	if isLeader {
+		rf.log = append(rf.log, LogEntry{
+			Term:    term,
+			Command: command,
+		})
+		lastIndex := len(rf.log) - 1
+		rf.nextIndex[rf.me] = lastIndex + 1
+		rf.matchIndex[rf.me] = lastIndex
 	}
 	return index, term, isLeader
 }
@@ -587,7 +585,7 @@ func (rf *Raft) ticker() {
 			//fmt.Printf("[Ticker] ID=%d Heartbeat time out.\n", rf.me)
 			rf.mu.Lock()
 			if rf.currentRole == ROLE_LEADER {
-				rf.SendHeartbeat()
+				rf.SendAppendEntries()
 				rf.heartbeatTimer.Reset(HEARTBEAT_TIMEOUT * time.Millisecond)
 			}
 			rf.mu.Unlock()
@@ -634,20 +632,20 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.currentTerm = 1 // initialize with 1.
 	rf.votedFor = -1   // peer id, -1: not vote for any peer.
 
-	rf.commitIndex = -1
-	rf.lastApplied = -1
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
-
 	rf.log = make([]LogEntry, 0)
 	rf.applyCh = applyCh
+
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 	for peer := range rf.peers {
 		rf.nextIndex[peer] = 0
 		rf.matchIndex[peer] = -1
 	}
-
 	rf.mu.Unlock()
-	fmt.Printf("[Raft] Peer=%d start...\n", me)
+	//fmt.Printf("[Raft] Peer=%d start...\n", me)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -688,8 +686,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3: leader, do nothing
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Printf("[AppendEntries] ID=%d, Term=%d send AppendEntries to ID=%d, Term=%d",
-		args.LeaderId, args.Term, rf.me, rf.currentTerm)
+	//fmt.Printf("[AppendEntries] ID=%d, Term=%d send AppendEntries to ID=%d, Term=%d", args.LeaderId, args.Term, rf.me, rf.currentTerm)
 	reply.Success = true
 
 	// 1. Reply false if args term < current term
@@ -720,7 +717,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// b. current peer's last log's index >= leader's one, but term in args prevLogIndex are not
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if lastLogIndex != -1 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -783,7 +780,7 @@ func (rf *Raft) switchRole(role ServerRole) {
 		for i := range rf.matchIndex {
 			rf.matchIndex[i] = 0
 		}
-		rf.SendHeartbeat()
+		rf.SendAppendEntries()
 		rf.heartbeatTimer.Reset(HEARTBEAT_TIMEOUT * time.Millisecond)
 	}
 }
@@ -810,7 +807,7 @@ func (rf *Raft) setCommitIndex(index int) {
 	// apply entries between lastApplied and commmit
 	// should be revoked after current commitIndex updated.
 	if rf.commitIndex > rf.lastApplied {
-		fmt.Printf("[Apply] ID=%d apply between index=%d and index=%d", rf.me, rf.lastApplied+1, rf.commitIndex)
+		//fmt.Printf("[Apply] ID=%d apply between index=%d and index=%d", rf.me, rf.lastApplied+1, rf.commitIndex)
 		entriesToApply := append([]LogEntry{}, rf.log[(rf.lastApplied+1):(rf.commitIndex+1)]...)
 
 		// new goroutine to apply entries
