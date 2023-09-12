@@ -175,7 +175,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // Leader
 // revoke by leader, for send append entries
 //
-func (rf *Raft) SendAppendEntries() {
+func (rf *Raft) SendppendEntries() {
 	// send append entries to all peers.
 	for server := range rf.peers {
 		if server == rf.me {
@@ -440,7 +440,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// b.
-	if (args.LastLogTerm == rf.log[lastLogIndex].Term && args.LastLogIndex < lastLogIndex) {
+	if args.LastLogTerm == rf.log[lastLogIndex].Term && args.LastLogIndex < lastLogIndex {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -712,24 +712,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// current peer's last log's index or term need to = leader's one
 
 	// a. current peers' last log's index < leader's one
-	lastLogIndex := len(rf.log) - 1
+	lastLogIndex := len(rf.log) - 1 // index start with 0
 	if lastLogIndex < args.PrevLogIndex {
-		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.Success = false
 		return
 	}
 
-	// b. current peer's last log's index >= leader's one, but term in args prevLogIndex not
+	// b. current peer's last log's index >= leader's one, but term in args prevLogIndex are not
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.Success = false
 		return
 	}
 
-	// 3. Append any new entries not already in the index from args.PrevLogIndex + 1
-	// a.
+	// 3. Log consistency check pass.
+	//  Append any new entries not already in the index from args.PrevLogIndex + 1
+	//  unmatchIndex: index of args entries, which not match in current peers.
+	// 0	1	2	3	4	5	6
+	// 1	1	2	2	[3]	[3]	[3]  - leader
+	// 1	1	2	2	3 - follower
+	// above example, args entries: [3, 3, 3], unmatchIndex is 5
 	unmatchIndex := -1
 	for index := range args.Entries {
+		if len(rf.log)-1 < args.PrevLogIndex+index+1 {
+			unmatchIndex = index
+			break
+		}
 		if rf.log[args.PrevLogIndex+index+1].Term != args.Entries[index].Term {
 			unmatchIndex = index
 			break
@@ -745,7 +754,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 4. if leader's commit > commitIndex, set commitIndex = min(leader's commit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-
+		rf.setCommitIndex(min(args.LeaderCommit, len(rf.log)-1))
 	}
 }
 
@@ -794,7 +803,7 @@ func getCurrentTime() int64 {
 }
 
 //
-// set commit index
+// set commit index and update apply
 //
 func (rf *Raft) setCommitIndex(index int) {
 	rf.commitIndex = index
@@ -804,8 +813,9 @@ func (rf *Raft) setCommitIndex(index int) {
 		fmt.Printf("[Apply] ID=%d apply between index=%d and index=%d", rf.me, rf.lastApplied+1, rf.commitIndex)
 		entriesToApply := append([]LogEntry{}, rf.log[(rf.lastApplied+1):(rf.commitIndex+1)]...)
 
-		go func(startIndex int, entries []LogEntry) {
-			for index, entry := range entries {
+		// new goroutine to apply entries
+		go func(startIndex int, entriesToApply []LogEntry) {
+			for index, entry := range entriesToApply {
 				msg := ApplyMsg{
 					CommandValid: true,
 					Command:      entry.Command,
@@ -821,5 +831,13 @@ func (rf *Raft) setCommitIndex(index int) {
 				rf.mu.Unlock()
 			}
 		}(rf.lastApplied+1, entriesToApply)
+	}
+}
+
+func min(x, y int) int {
+	if x < y {
+		return x
+	} else {
+		return y
 	}
 }
