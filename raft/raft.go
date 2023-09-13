@@ -20,11 +20,13 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -124,13 +126,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -142,17 +144,21 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		// error
+		panic("[readPersist] failed to decode persist data.")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -255,6 +261,7 @@ func (rf *Raft) SendAppendEntry(server int) {
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.switchRole(ROLE_FOLLOWER)
+			rf.persist() // currentTerm changed, need persist (4)
 		} else {
 			// decrease next index, retry in next rpc
 			rf.nextIndex[server] -= 1
@@ -313,6 +320,7 @@ func (rf *Raft) StartElection() {
 	rf.votedFor = rf.me
 	rf.votedCount = 1 // include self
 	rf.currentTerm += 1
+	rf.persist()                               // votedFor and currentTerm changed, need to persist (5)
 	rf.electionTimer.Reset(getRandomTimeout()) // reset election timeout (3)
 
 	//fmt.Printf("[Election] ID=%d, Term=%d start election.\n", rf.me, rf.currentTerm)
@@ -352,6 +360,7 @@ func (rf *Raft) StartElection() {
 			if reply.Term > rf.currentTerm {
 				rf.switchRole(ROLE_FOLLOWER)
 				rf.currentTerm = reply.Term
+				rf.persist() // currentTerm changed, need to persist (6)
 			}
 			if reply.VoteGranted && rf.currentRole == ROLE_CANDIDATE {
 				rf.votedCount += 1
@@ -391,6 +400,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist() // rf.votedFor, need persist (1)
 	//fmt.Printf("[RequestVote] ID=%d, Role=%d, Term=%d recived vote request.\n", rf.me, rf.currentRole, rf.currentTerm)
 
 	// term --> identity --> log
@@ -519,6 +529,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    term,
 			Command: command,
 		})
+		rf.persist() // log changed, need persist (3)
 		//fmt.Printf("[Start] log=%v\n", rf.log)
 		index = len(rf.log) - 1
 		rf.nextIndex[rf.me] = index + 1
@@ -654,6 +665,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3: leader, do nothing
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist() // rf.currentTerm, need persist (2)
 	//fmt.Printf("[AppendEntries] ID=%d send AppendEntries to ID=%d, args=%v.\n", args.LeaderId, rf.me, args)
 	reply.Success = true
 
