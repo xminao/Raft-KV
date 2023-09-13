@@ -264,52 +264,22 @@ func (rf *Raft) SendAppendEntry(server int) {
 			rf.persist() // currentTerm changed, need persist (4)
 		} else {
 			// decrease next index, retry in next rpc
-			rf.nextIndex[server] -= 1
+			rf.nextIndex[server] = reply.ConflictIndex
+
+			// if term found, override it to the first  entry after entries in conflictTerm
+			if reply.ConflictTerm != -1 {
+				for i := args.PrevLogIndex; i >= 1; i -= 1 {
+					// in next trial, check if log entries in ConflictTerm matches
+					if rf.log[i-1].Term == reply.ConflictTerm {
+						rf.nextIndex[server] = i
+						break
+					}
+				}
+			}
 		}
 	}
 	rf.mu.Unlock()
 }
-
-//
-// Leader
-// send heartbeat (no log AppendEntries)
-//
-/*
-func (rf *Raft) SendHeartbeat() {
-	for server := range rf.peers {
-		// send heartbeat rpc to every peer.
-		if server == rf.me {
-			continue
-		}
-		// new goroutine, prevent blocked.
-		go func(server int) {
-			// empty appendEntries, heartbeat
-			args := AppendEntriesArgs{}
-			reply := AppendEntriesReply{}
-			rf.mu.Lock()
-			args.Term = rf.currentTerm
-			rf.mu.Unlock()
-
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			if !ok {
-				//fmt.Printf("[SendHeartbeat]  ID=%d, Role=%d, Term=%d send heartbeat to Server=%d failed.\n", rf.me, rf.currentRole, rf.currentTerm, server)
-				return
-			} else {
-				//fmt.Printf("[SendHeartbeat]  ID=%d, Role=%d, Term=%d send heartbeat to Server=%d successed.\n", rf.me, rf.currentRole, rf.currentTerm, server)
-			}
-
-			// handle reply from peer which response.
-			rf.mu.Lock()
-			if reply.Term > args.Term {
-				// switch to follower if new leader exist.
-				rf.switchRole(ROLE_FOLLOWER)
-				rf.currentTerm = reply.Term
-			}
-			rf.mu.Unlock()
-		}(server)
-	}
-}
-*/
 
 //
 // Candidate
@@ -621,7 +591,13 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
+	rf.readPersist(persister.ReadRaftState())
+
 	rf.nextIndex = make([]int, len(rf.peers))
+	// for persist
+	for index := range rf.nextIndex {
+		rf.nextIndex[index] = len(rf.log)
+	}
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.mu.Unlock()
 	//fmt.Printf("[Raft] Peer=%d start...\n", me)
@@ -648,8 +624,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term          int
-	Success       bool
+	Term    int
+	Success bool
+	// Figure 8.
+	// leader only can commit log which term = leader's term.(can't commit older term log directly)
 	ConflictIndex int
 	ConflictTerm  int
 }
@@ -697,6 +675,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if lastLogIndex < args.PrevLogIndex {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		// optimistically thinks receiver's log matches with leader's as subset, like this.
+		// 0	1	2	3	4	5
+		// 0	1	1	2	2	[3]	leader
+		// 0	1	1	2	2		follower
+		reply.ConflictIndex = len(rf.log) // in above, conflict index is 5
+		// no conflict term
+		reply.ConflictTerm = -1
 		return
 	}
 
@@ -707,6 +692,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		// receiver's log in certain term unmatches leader's log
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+
+		// expecting leader to check the former term
+		// so set conflictIndex to the first one of entries in conflictTerm
+		conflictIndex := args.PrevLogIndex
+		// apparently, since rf.log[0] are ensured to match among all servers,
+		// conflictIndex must be > 0, safe to minus 1
+		for rf.log[conflictIndex-1].Term == reply.ConflictTerm {
+			conflictIndex -= 1
+		}
+		reply.ConflictIndex = conflictIndex
 		return
 	}
 
