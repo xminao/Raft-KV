@@ -321,13 +321,15 @@ func (rf *Raft) StartElection() {
 		if server == rf.me {
 			continue
 		}
-
 		// start new goroutine to send request vote rpc
 		go func(server int) {
 			rf.mu.Lock()
+			lastLogIndex := len(rf.log) - 1
 			args := RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidatedID: rf.me,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  rf.log[lastLogIndex].Term,
 			}
 			reply := RequestVoteReply{}
 			rf.mu.Unlock()
@@ -350,13 +352,12 @@ func (rf *Raft) StartElection() {
 			if reply.Term > rf.currentTerm {
 				rf.switchRole(ROLE_FOLLOWER)
 				rf.currentTerm = reply.Term
-				rf.votedFor = -1
-			} else if reply.VoteGranted && rf.currentRole == ROLE_CANDIDATE {
+			}
+			if reply.VoteGranted && rf.currentRole == ROLE_CANDIDATE {
 				rf.votedCount += 1
 				if rf.votedCount*2 > len(rf.peers) {
 					//fmt.Printf("[StartElection] ID=%d won the election.\n", rf.me)
 					rf.switchRole(ROLE_LEADER)
-					rf.SendAppendEntries()
 				}
 			}
 		}(server)
@@ -659,6 +660,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 1. Reply false if args term < current term
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
 	}
 
 	// 2. switch to follower if args term > current term, and reset election time out
@@ -727,7 +730,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 4. if leader's commit > commitIndex, set commitIndex = min(leader's commit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		rf.setCommitIndex(min(args.LeaderCommit, len(rf.log)))
+		rf.setCommitIndex(min(args.LeaderCommit, len(rf.log)-1))
 	}
 
 	reply.Success = true
@@ -754,11 +757,12 @@ func (rf *Raft) switchRole(role ServerRole) {
 	case ROLE_LEADER:
 		// initialize nextIndex with leader last log index + 1
 		// initialize matchIndex with 0
-		rf.heartbeatTimer.Reset(HEARTBEAT_TIMEOUT * time.Millisecond)
 		for i := range rf.peers {
 			rf.nextIndex[i] = len(rf.log)
 			rf.matchIndex[i] = 0
 		}
+		rf.SendAppendEntries()
+		rf.heartbeatTimer.Reset(HEARTBEAT_TIMEOUT * time.Millisecond)
 	}
 }
 
