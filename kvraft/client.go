@@ -8,11 +8,11 @@ import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
+	servers []*labrpc.ClientEnd // kvservers
 	// You will have to modify this struct.
-	leaderId int   // cache kvserver leader id, reduce invalid requests.
-	ckId     int64 // clear unique id
+	me       int64 // clerk unique id
 	seqId    int   // request seq id
+	leaderId int   // cache kvserver leader id, reduce invalid requests.
 }
 
 func nrand() int64 {
@@ -26,6 +26,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.me = nrand()
+	ck.seqId = -1
 	return ck
 }
 
@@ -42,18 +44,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
 	args := GetArgs{
 		Key:     key,
-		ClerkId: ck.ckId,
+		ClerkId: ck.me,
 		SeqId:   ck.allocSeqId(),
 	}
 	reply := GetReply{}
-	server := ck.leaderId
+	server := ck.leaderId // kvserver which ck will rpc with.
+
 	for {
 		ok := ck.SendGet(server%len(ck.servers), &args, &reply)
 		if ok {
+			// server not leader, change server id, retry
 			if reply.Err == ErrWrongLeader {
 				server += 1
 				continue
@@ -61,6 +63,7 @@ func (ck *Clerk) Get(key string) string {
 			ck.leaderId = server
 			break
 		} else {
+			// change server id, retry
 			server += 1
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -84,11 +87,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:     key,
 		Value:   value,
 		Op:      op,
-		ClerkId: ck.ckId,
+		ClerkId: ck.me,
 		SeqId:   ck.allocSeqId(),
 	}
 	reply := PutAppendReply{}
 	server := ck.leaderId
+
 	for {
 		ok := ck.SendPutAppend(server%len(ck.servers), &args, &reply)
 		if ok {
@@ -125,7 +129,6 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 // ----------------------- utils --------------------------------
-
 func (ck *Clerk) allocSeqId() int {
 	ck.seqId += 1
 	return ck.seqId
