@@ -504,6 +504,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = len(rf.log) - 1
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
+		rf.SendAppendEntries() // for 3a testspeed3a
 	}
 	return index, term, isLeader
 }
