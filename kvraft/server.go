@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,24 +19,27 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+// clerk struct in server, for convenience
+// tracks the operation.
 type ClerkOps struct {
 	seqId       int // clerk current seq id
 	getCh       chan Op
 	putAppendCh chan Op
-	msgUniqueId int
+	msgUniqueId int // uid for rpc waiting msg
 }
 
-// send to raft-library
+// kvserver send to raft-library, the argument of Start method.
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key     string
-	Value   string
-	Command string
-	ClerkId int64
-	SeqId   int
-	Server  int
+	Key   string
+	Value string
+	Name  string // operation name: "Get", "Put", "Append"
+
+	ClerkId   int64
+	CommandId int
+	ServerId  int
 }
 
 type KVServer struct {
@@ -48,14 +52,117 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dataSource           map[string]string
+	dispatcher           map[int]chan Notification
+	lastAppliedCommandId map[int64]int // key:clerkId value:commandId, identify a unique command
 }
 
+type Notification struct {
+	ClerkId   int64
+	CommandId int
+}
+
+// is duplicate command in clerk: clearId
+func (kv *KVServer) isDuplicateCommand(clerkId int64, commandId int) bool {
+	appliedCommandId, ok := kv.lastAppliedCommandId[clerkId]
+	if !ok || commandId > appliedCommandId {
+		return false
+	}
+	return true
+}
+
+// return wrongleader
+func (kv *KVServer) waitApplying(op Op, timeout time.Duration) Err {
+	// return common part of GetReply and PutAppendReply
+	//i.e, WrongLeader
+	// send command to raft-library, revoke Start.
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	if _, ok := kv.dispatcher[index]; !ok {
+		// if in index no notification, create new
+		//fmt.Printf("new notification in index=%d\n", index)
+		kv.dispatcher[index] = make(chan Notification, 1)
+	}
+	ch := kv.dispatcher[index]
+	kv.mu.Unlock()
+
+	var err Err
+
+	select {
+	case notify := <-ch:
+		//fmt.Printf("notify=%v, op.clerk=%d, op.commandid=%d\n", notify, op.ClerkId, op.CommandId)
+		if notify.ClerkId != op.ClerkId || notify.CommandId != op.CommandId {
+			// leader has changed
+			err = ErrWrongLeader
+		} else {
+			err = OK
+		}
+	case <-time.After(timeout):
+		kv.mu.Lock()
+		if kv.isDuplicateCommand(op.ClerkId, op.CommandId) {
+			err = OK
+		} else {
+			err = ErrWrongLeader
+		}
+		kv.mu.Unlock()
+	}
+
+	kv.mu.Lock()
+	delete(kv.dispatcher, index)
+	kv.mu.Unlock()
+	return err
+}
+
+//
+// args: client send to kv, reply: kv reply to client
+//
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{
+		Key:       args.Key,
+		Name:      "Get",
+		ClerkId:   args.ClerkId,
+		CommandId: args.CommandId,
+		ServerId:  kv.me,
+	}
+
+	// wait for raft being applied
+	// or leader changed (log is override, and never gets applied)
+	reply.Err = kv.waitApplying(op, 500*time.Millisecond)
+
+	if reply.Err != ErrWrongLeader {
+		kv.mu.Lock()
+		value, ok := kv.dataSource[args.Key]
+		kv.mu.Unlock()
+		if ok {
+			reply.Value = value
+			return
+		} else {
+			reply.Err = ErrNoKey
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Name:      args.Op,
+		ClerkId:   args.ClerkId,
+		CommandId: args.CommandId,
+		ServerId:  kv.me,
+	}
+
+	reply.Err = kv.waitApplying(op, 500*time.Millisecond)
+
+	//fmt.Printf("time=%v, args=%v, wrongleader=%v.\n", time.Now(), args, reply.WrongLeader)
+}
+
+func returnFalse() bool {
+	return false
 }
 
 //
@@ -107,7 +214,42 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.dataSource = make(map[string]string)
+	kv.dispatcher = make(map[int]chan Notification)
+	kv.lastAppliedCommandId = make(map[int64]int)
 
+	// You may need initialization code here.
+	go func() {
+		for msg := range kv.applyCh {
+			if !msg.CommandValid {
+				continue
+			}
+
+			op := msg.Command.(Op)
+			kv.mu.Lock()
+			if kv.isDuplicateCommand(op.ClerkId, op.CommandId) {
+				kv.mu.Unlock()
+				continue
+			}
+
+			switch op.Name {
+			case "Put":
+				kv.dataSource[op.Key] = op.Value
+			case "Append":
+				kv.dataSource[op.Key] += op.Value
+			}
+			kv.lastAppliedCommandId[op.ClerkId] = op.CommandId
+
+			if ch, ok := kv.dispatcher[msg.CommandIndex]; ok {
+				notify := Notification{
+					ClerkId:   op.ClerkId,
+					CommandId: op.CommandId,
+				}
+				ch <- notify
+			}
+
+			kv.mu.Unlock()
+		}
+	}()
 	return kv
 }
