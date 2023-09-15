@@ -4,6 +4,8 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -55,6 +57,31 @@ type KVServer struct {
 	dataSource           map[string]string
 	dispatcher           map[int]chan Notification
 	lastAppliedCommandId map[int64]int // key:clerkId value:commandId, identify a unique command
+
+	appliedRaftLogIndex int
+}
+
+func (kv *KVServer) needTakeSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	if kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+		return true
+	}
+	return false
+}
+
+func (kv *KVServer) takeSnapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
+	e.Encode(kv.dataSource)
+	e.Encode(kv.lastAppliedCommandId)
+	appliedRaftLogIndex := kv.appliedRaftLogIndex
+	kv.mu.Unlock()
+
+	kv.rf.Snapshot(appliedRaftLogIndex, w.Bytes())
 }
 
 type Notification struct {
@@ -79,6 +106,10 @@ func (kv *KVServer) waitApplying(op Op, timeout time.Duration) Err {
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		return ErrWrongLeader
+	}
+
+	if kv.needTakeSnapshot() {
+		kv.takeSnapshot()
 	}
 
 	kv.mu.Lock()
@@ -161,10 +192,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//fmt.Printf("time=%v, args=%v, wrongleader=%v.\n", time.Now(), args, reply.WrongLeader)
 }
 
-func returnFalse() bool {
-	return false
-}
-
 //
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
@@ -218,14 +245,25 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.dispatcher = make(map[int]chan Notification)
 	kv.lastAppliedCommandId = make(map[int64]int)
 
+	// recover from snapshot
+	snapshot := persister.ReadSnapshot()
+	kv.installSnapshot(snapshot)
+
 	// You may need initialization code here.
 	go func() {
+		// range channel will wait for channel closed.
 		for msg := range kv.applyCh {
-			if !msg.CommandValid {
+			// if command not valid
+			if !msg.CommandValid && !msg.SnapshotValid {
 				continue
 			}
 
-			op := msg.Command.(Op)
+			if msg.SnapshotValid {
+				kv.installSnapshot(msg.Snapshot)
+				continue
+			}
+
+			op := msg.Command.(Op) // parse command to Op
 			kv.mu.Lock()
 			if kv.isDuplicateCommand(op.ClerkId, op.CommandId) {
 				kv.mu.Unlock()
@@ -239,6 +277,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				kv.dataSource[op.Key] += op.Value
 			}
 			kv.lastAppliedCommandId[op.ClerkId] = op.CommandId
+			kv.appliedRaftLogIndex = msg.SnapshotIndex
 
 			if ch, ok := kv.dispatcher[msg.CommandIndex]; ok {
 				notify := Notification{
@@ -252,4 +291,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		}
 	}()
 	return kv
+}
+
+func (kv *KVServer) installSnapshot(snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot != nil {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		if d.Decode(&kv.dataSource) != nil ||
+			d.Decode(&kv.lastAppliedCommandId) != nil {
+			fmt.Printf("recover snapshot error.")
+		}
+	}
 }
